@@ -13,6 +13,7 @@ if (verdict.decision === "block") {
 }
 
 await pool.query(llmGeneratedSql);
+```
 ## 28-Vector Red-Team Verification Suite
 
 | Test Vector | SQL Payload | Expected | Actual | Rule Triggered | Latency (ms) |
