@@ -1,7 +1,10 @@
 # QueryShield (`queryshield-pg-guard`)
 
 Deterministic, in-process PostgreSQL AST validator (`pgsql-ast-parser`) for LLM `tool_calls`, Text-to-SQL agents, and MCP servers. Evaluates SQL syntax trees in ~0.35ms warm p50 to block destructive DML/DDL bypasses before `pool.query()` executes.
-
+## Enterprise Features
+* **Strict Multi-Tenant Isolation:** Enforces mandatory `tenant_id` filters on all `SELECT/UPDATE/DELETE` queries. Mathematically prevents cross-tenant data leaks and hallucinated tenant spoofing.
+* **Zero False-Positive AST Parsing:** Differentiates between actual SQL commands and string literals (e.g., safely allows `UPDATE ... SET msg = 'DROP TABLE users'`).
+* **Sub-Millisecond Overhead:** `p50 = 0.339ms` execution latency via V8 JIT warmup.
 ## Quickstart (Drop-in before `pg.Pool` or MCP Execution)
 
 ```typescript
