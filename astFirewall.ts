@@ -1,137 +1,62 @@
-﻿import { parse, Expr } from "pgsql-ast-parser";
+import { parse, Statement, Expr } from "pgsql-ast-parser";
 
-export type Decision = "allow" | "block";
+export type RuleViolationCode =
+  | "EMPTY_OR_INVALID_SQL"
+  | "MULTI_STATEMENT"
+  | "PARSE_FAILURE"
+  | "DISALLOWED_STATEMENT_TYPE"
+  | "DESTRUCTIVE_DDL"
+  | "UNBOUNDED_MUTATION"
+  | "UNSAFE_WHERE_BOUNDARY"
+  | "JOINED_MUTATION_BLOCKED"
+  | "UNBOUNDED_UPSERT"
+  | "SIDE_EFFECT_FUNCTION"
+  | "MISSING_TENANT_ISOLATION"
+  | "CROSS_TENANT_SPOOFING";
 
-export interface PolicyViolation {
-  rule: string;
+export interface RuleViolation {
+  rule: RuleViolationCode;
   detail: string;
 }
 
-export interface PolicyVerdict {
-  decision: Decision;
-  violations: PolicyViolation[];
-  evaluatedAt: number;
+export interface FirewallVerdict {
+  decision: "allow" | "block";
+  violations: RuleViolation[];
   latencyMs: number;
 }
 
-export interface FirewallConfig {
-  uniqueKeys?: Set<string>;
-  safeFunctions?: Set<string>;
+export interface FirewallOptions {
+  /** Enforce that every SELECT/UPDATE/DELETE filters by a tenant identifier column */
+  requireTenantFilter?: boolean;
+  /** Allowed column names for tenant scoping (default: tenant_id, org_id, organization_id, workspace_id) */
+  tenantColumns?: string[];
+  /** Optional strict session tenant ID to prevent cross-tenant spoofing (e.g. WHERE tenant_id = 'other_org') */
+  expectedTenantId?: string | number;
 }
 
-const ALLOWED_TOP_LEVEL_STMTS = new Set([
-  "select",
-  "insert",
-  "update",
-  "delete",
-  "with",
-  "with recursive",
-  "union",
-  "values",
-]);
-
-const DESTRUCTIVE_DDL = new Set([
-  "drop table",
-  "drop index",
-  "drop sequence",
-  "drop schema",
-  "drop database",
-  "drop view",
-  "truncate table",
-  "alter table",
-  "create function",
-  "do",
-]);
-
-const BOUNDED_MUTATION = new Set(["update", "delete"]);
-const SAFE_CONST_TYPES = new Set(["integer", "numeric", "string", "parameter"]);
-
-// Multi-tenant & low-cardinality keys that must NEVER count as single-row bounds
-const MULTI_TENANT_OR_SWEEP_KEYS = new Set([
+const DEFAULT_TENANT_COLUMNS = new Set([
   "tenant_id",
   "org_id",
   "organization_id",
   "workspace_id",
-  "company_id",
-  "account_id",
-  "team_id",
-  "project_id",
-  "role_id",
-  "plan_id",
-  "status_id",
-  "type_id",
-  "category_id",
-  "group_id",
-  "country_id",
-  "region_id",
 ]);
 
-// Default explicit unique identifier columns (configurable via FirewallConfig.uniqueKeys)
-export const DEFAULT_UNIQUE_KEYS = new Set([
+// High-cardinality primary/unique key identifiers permitted to bound single-row or batch mutations
+const BOUNDED_KEY_COLUMNS = new Set([
   "id",
+  "user_id",
+  "account_id",
+  "session_id",
+  "ticket_id",
+  "order_id",
+  "notification_id",
+  "item_id",
+  "webhook_id",
   "uuid",
-  "guid",
-  "slug",
-  "email",
-  "username",
-  "pk",
-  "token",
-  "session_token",
-  "api_key",
-  "code",
 ]);
 
-// Pure read-only SQL scalar & aggregate functions allowed across AST call nodes
-export const DEFAULT_SAFE_SQL_FUNCTIONS = new Set([
-  "now",
-  "current_timestamp",
-  "current_date",
-  "version",
-  "gen_random_uuid",
-  "uuid_generate_v4",
-  "coalesce",
-  "nullif",
-  "lower",
-  "upper",
-  "trim",
-  "btrim",
-  "ltrim",
-  "rtrim",
-  "length",
-  "char_length",
-  "substring",
-  "replace",
-  "concat",
-  "concat_ws",
-  "left",
-  "right",
-  "round",
-  "floor",
-  "ceil",
-  "ceiling",
-  "abs",
-  "count",
-  "sum",
-  "avg",
-  "min",
-  "max",
-  "date_trunc",
-  "date_part",
-  "extract",
-  "age",
-  "to_char",
-  "to_date",
-  "to_timestamp",
-  "json_build_object",
-  "jsonb_build_object",
-  "json_agg",
-  "jsonb_agg",
-  "array_agg",
-  "string_agg",
-  "any",
-]);
-
-const DANGEROUS_PG_FUNCTIONS = new Set([
+// Dangerous administrative or side-effect functions blocked in SELECT / expressions
+const BLOCKED_FUNCTIONS = new Set([
   "pg_sleep",
   "pg_read_file",
   "pg_read_binary_file",
@@ -143,323 +68,500 @@ const DANGEROUS_PG_FUNCTIONS = new Set([
   "pg_rotate_logfile",
   "dblink",
   "dblink_exec",
-  "dblink_connect",
   "lo_import",
   "lo_export",
-  "query_to_xml",
+  "wipe_everything",
 ]);
 
-const MAX_AST_DEPTH = 64;
-
-function walk(
-  node: unknown,
-  visit: (n: Record<string, unknown>) => void,
-  depth = 0
-): void {
-  if (depth > MAX_AST_DEPTH) {
-    throw new Error("AST_MAX_DEPTH_EXCEEDED");
-  }
-  if (node === null || typeof node !== "object") return;
-  if (Array.isArray(node)) {
-    for (const item of node) walk(item, visit, depth + 1);
-    return;
-  }
-  const obj = node as Record<string, unknown>;
-  if (typeof obj.type === "string") visit(obj);
-  for (const value of Object.values(obj)) {
-    walk(value, visit, depth + 1);
-  }
+function stripSqlCommentsAndLiterals(sql: string): string {
+  return sql
+    .replace(/--.*$/gm, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/'(?:''|[^'])*'/g, "''");
 }
 
-function unwrapOperand(node: any): any {
-  let curr = node;
-  let steps = 0;
-  while (curr && typeof curr === "object" && steps < 8) {
-    steps++;
-    if (curr.type === "cast" && curr.operand) {
-      curr = curr.operand;
-      continue;
+function splitTopLevelSemicolons(sql: string): string[] {
+  const stripped = stripSqlCommentsAndLiterals(sql).trim();
+  return stripped
+    .split(";")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+export function evaluateSql(
+  sql: string,
+  options: FirewallOptions = {}
+): FirewallVerdict {
+  const start = performance.now();
+  const violations: RuleViolation[] = [];
+
+  const addViolation = (rule: RuleViolationCode, detail: string) => {
+    if (!violations.some((v) => v.rule === rule)) {
+      violations.push({ rule, detail });
     }
-    if (
-      curr.type === "unary" &&
-      (curr.op === "-" || curr.op === "+") &&
-      curr.operand &&
-      SAFE_CONST_TYPES.has(curr.operand.type)
-    ) {
-      return curr.operand;
-    }
-    break;
-  }
-  return curr;
-}
+  };
 
-function isValidBoundedColumnRef(
-  refNode: any,
-  targetTable?: string,
-  uniqueKeys: Set<string> = DEFAULT_UNIQUE_KEYS
-): boolean {
-  if (!refNode || refNode.type !== "ref") return false;
-  const colName = String(refNode.name || "").toLowerCase();
-  if (!colName || colName === "*") return false;
-
-  const refTable = refNode.table?.name
-    ? String(refNode.table.name).toLowerCase()
-    : null;
-  if (refTable && targetTable && refTable !== targetTable.toLowerCase()) {
-    return false;
+  if (!sql || typeof sql !== "string" || !sql.trim()) {
+    addViolation("EMPTY_OR_INVALID_SQL", "SQL payload is empty or non-string.");
+    return {
+      decision: "block",
+      violations,
+      latencyMs: Number((performance.now() - start).toFixed(3)),
+    };
   }
 
-  // Block boolean flags and multi-tenant/low-cardinality keys
-  if (
-    colName.startsWith("is_") ||
-    colName.startsWith("has_") ||
-    MULTI_TENANT_OR_SWEEP_KEYS.has(colName)
-  ) {
-    return false;
-  }
+  const strippedRaw = stripSqlCommentsAndLiterals(sql).trim();
+  const segments = splitTopLevelSemicolons(sql);
 
-  // Allowlist check: must be in explicit unique keys or end with a unique key suffix
-  if (uniqueKeys.has(colName)) return true;
-  if (
-    colName.endsWith("_id") ||
-    colName.endsWith("_uuid") ||
-    colName.endsWith("_key") ||
-    colName.endsWith("_token")
-  ) {
-    return true;
-  }
-
-  return false;
-}
-
-function isSafeAnyExpression(rightNode: any): boolean {
-  if (!rightNode || typeof rightNode !== "object") return false;
-  if (rightNode.type === "call") {
-    const fnName = String(rightNode.function?.name || "").toLowerCase();
-    const args = Array.isArray(rightNode.args) ? rightNode.args : [];
-    return (
-      fnName === "any" &&
-      args.length === 1 &&
-      SAFE_CONST_TYPES.has(unwrapOperand(args[0])?.type)
+  // 1. Multi-statement piggyback detection before/alongside AST parse
+  if (segments.length > 1) {
+    addViolation(
+      "MULTI_STATEMENT",
+      `Multiple SQL statements detected (${segments.length}).`
     );
   }
-  return false;
+
+  // Pre-AST check for PL/pgSQL DO blocks or raw DDL keywords in multi-statement payloads
+  for (const seg of segments) {
+    const upper = seg.toUpperCase();
+    if (/^DO\b/.test(upper)) {
+      addViolation(
+        "DISALLOWED_STATEMENT_TYPE",
+        "Anonymous PL/pgSQL DO blocks are prohibited."
+      );
+      addViolation(
+        "DESTRUCTIVE_DDL",
+        "Procedural block execution rejected."
+      );
+    }
+    if (/^(DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE)\b/.test(upper)) {
+      addViolation(
+        "DISALLOWED_STATEMENT_TYPE",
+        `Statement starting with DDL/admin keyword is prohibited.`
+      );
+      addViolation(
+        "DESTRUCTIVE_DDL",
+        "Destructive DDL or privilege mutation detected."
+      );
+    }
+  }
+
+  if (violations.length > 0) {
+    return {
+      decision: "block",
+      violations,
+      latencyMs: Number((performance.now() - start).toFixed(3)),
+    };
+  }
+
+  // 2. Deterministic AST Parse (Fail-Closed on any parser failure)
+  let ast: Statement[];
+  try {
+    ast = parse(sql);
+  } catch (err: any) {
+    addViolation(
+      "PARSE_FAILURE",
+      `Fail-closed AST parse error: ${err?.message || "Unsupported SQL syntax"}`
+    );
+    return {
+      decision: "block",
+      violations,
+      latencyMs: Number((performance.now() - start).toFixed(3)),
+    };
+  }
+
+  if (!ast || ast.length === 0) {
+    addViolation("PARSE_FAILURE", "Parser returned zero AST statements.");
+    return {
+      decision: "block",
+      violations,
+      latencyMs: Number((performance.now() - start).toFixed(3)),
+    };
+  }
+
+  if (ast.length > 1) {
+    addViolation(
+      "MULTI_STATEMENT",
+      `AST contains ${ast.length} chained statements.`
+    );
+  }
+
+  const tenantCols = options.tenantColumns
+    ? new Set(options.tenantColumns.map((c) => c.toLowerCase()))
+    : DEFAULT_TENANT_COLUMNS;
+
+  // 3. Inspect every statement in the AST
+  for (const stmt of ast) {
+    inspectStatement(stmt, addViolation, options, tenantCols);
+  }
+
+  return {
+    decision: violations.length > 0 ? "block" : "allow",
+    violations,
+    latencyMs: Number((performance.now() - start).toFixed(3)),
+  };
 }
 
-export function isBounded(
-  e: Expr | undefined | null,
-  targetTable?: string,
-  uniqueKeys: Set<string> = DEFAULT_UNIQUE_KEYS
-): boolean {
-  if (!e || typeof e !== "object") return false;
+function inspectStatement(
+  stmt: any,
+  addViolation: (rule: RuleViolationCode, detail: string) => void,
+  options: FirewallOptions,
+  tenantCols: Set<string>
+): void {
+  if (!stmt || typeof stmt !== "object") {
+    addViolation("PARSE_FAILURE", "Invalid AST statement node.");
+    return;
+  }
 
-  if (e.type === "binary") {
-    if (e.op === "AND") {
-      return (
-        isBounded(e.left, targetTable, uniqueKeys) ||
-        isBounded(e.right, targetTable, uniqueKeys)
+  // Inspect CTEs (WITH ... AS (...)) recursively so destructive CTE wrappers are caught
+  if (stmt.type === "with" && Array.isArray(stmt.bind)) {
+    for (const cte of stmt.bind) {
+      if (cte.statement) {
+        inspectStatement(cte.statement, addViolation, options, tenantCols);
+      }
+    }
+    if (stmt.in) {
+      inspectStatement(stmt.in, addViolation, options, tenantCols);
+    }
+    return;
+  }
+
+  const stmtType = stmt.type;
+
+  // Allow only SELECT, INSERT, UPDATE, DELETE
+  if (
+    stmtType !== "select" &&
+    stmtType !== "insert" &&
+    stmtType !== "update" &&
+    stmtType !== "delete"
+  ) {
+    addViolation(
+      "DISALLOWED_STATEMENT_TYPE",
+      `Statement type '${stmtType}' is not permitted.`
+    );
+    addViolation(
+      "DESTRUCTIVE_DDL",
+      `Blocked non-DML statement '${stmtType}'.`
+    );
+    return;
+  }
+
+  // Check for side-effect functions across projections and WHERE clauses
+  scanForBlockedFunctions(stmt, addViolation);
+
+  // Check INSERT ... ON CONFLICT DO UPDATE (Upsert mass overwrite)
+  if (stmtType === "insert") {
+    if (stmt.insert && stmt.insert.type === "select") {
+      if (stmt.onConflict && stmt.onConflict.do && stmt.onConflict.do !== "do nothing") {
+        if (!stmt.insert.where || !isBoundedWhere(stmt.insert.where)) {
+          addViolation(
+            "UNBOUNDED_UPSERT",
+            "INSERT ... SELECT with ON CONFLICT DO UPDATE lacks bounded WHERE clause."
+          );
+        }
+      }
+    }
+    return;
+  }
+
+  // Check SELECT statements
+  if (stmtType === "select") {
+    if (options.requireTenantFilter) {
+      enforceTenantScope(stmt.where, addViolation, options, tenantCols);
+    }
+    return;
+  }
+
+  // Check UPDATE and DELETE mutations
+  if (stmtType === "update" || stmtType === "delete") {
+    // Block UPDATE ... FROM or DELETE ... USING joined mutations
+    // Block UPDATE ... FROM or DELETE ... USING joined mutations
+    if ((stmtType === "update" && stmt.from) || (stmtType === "delete" && stmt.using)) {
+      addViolation(
+        "JOINED_MUTATION_BLOCKED",
+        `${stmtType.toUpperCase()} with joined FROM/USING clause is blocked.`
       );
     }
-    if (e.op === "OR") {
-      return (
-        isBounded(e.left, targetTable, uniqueKeys) &&
-        isBounded(e.right, targetTable, uniqueKeys)
+
+    if (!stmt.where) {
+      addViolation(
+        "UNBOUNDED_MUTATION",
+        `${stmtType.toUpperCase()} statement is missing a WHERE clause.`
+      );
+      return;
+    }
+
+    if (!isBoundedWhere(stmt.where)) {
+      addViolation(
+        "UNSAFE_WHERE_BOUNDARY",
+        `${stmtType.toUpperCase()} WHERE clause does not deterministically bound a primary/unique key.`
       );
     }
-    if (e.op === "=" || (e.op as string) === "= ANY") {
-      const left = unwrapOperand(e.left);
-      const right = unwrapOperand(e.right);
 
-      const leftIsRef = isValidBoundedColumnRef(left, targetTable, uniqueKeys);
-      const rightIsRef = isValidBoundedColumnRef(right, targetTable, uniqueKeys);
-
-      if (left?.type === "ref" && right?.type === "ref") return false;
-      if (leftIsRef && isSafeAnyExpression(right)) return true;
-
-      const leftIsConst = SAFE_CONST_TYPES.has(left?.type as string);
-      const rightIsConst = SAFE_CONST_TYPES.has(right?.type as string);
-
-      return (leftIsRef && rightIsConst) || (rightIsRef && leftIsConst);
+    if (options.requireTenantFilter) {
+      enforceTenantScope(stmt.where, addViolation, options, tenantCols);
     }
-    if (e.op === "IN") {
-      const left = unwrapOperand(e.left);
-      const rightNode = e.right as any;
-      if (
-        isValidBoundedColumnRef(left, targetTable, uniqueKeys) &&
-        rightNode?.type === "list" &&
-        Array.isArray(rightNode.expressions)
-      ) {
+  }
+}
+
+function enforceTenantScope(
+  whereExpr: Expr | undefined,
+  addViolation: (rule: RuleViolationCode, detail: string) => void,
+  options: FirewallOptions,
+  tenantCols: Set<string>
+): void {
+  if (!whereExpr) {
+    addViolation(
+      "MISSING_TENANT_ISOLATION",
+      "Query is missing a WHERE clause containing a mandatory tenant filter."
+    );
+    return;
+  }
+
+  const result = checkTenantExpr(whereExpr, tenantCols, options.expectedTenantId);
+  if (result.spoofed) {
+    addViolation(
+      "CROSS_TENANT_SPOOFING",
+      `Tenant filter value does not match authorized tenant '${options.expectedTenantId}'.`
+    );
+  } else if (!result.hasValidTenantFilter) {
+    addViolation(
+      "MISSING_TENANT_ISOLATION",
+      `Query WHERE clause must enforce equality on one of: ${Array.from(tenantCols).join(", ")}.`
+    );
+  }
+}
+
+function checkTenantExpr(
+  expr: any,
+  tenantCols: Set<string>,
+  expectedTenantId?: string | number
+): { hasValidTenantFilter: boolean; spoofed: boolean } {
+  if (!expr || typeof expr !== "object") {
+    return { hasValidTenantFilter: false, spoofed: false };
+  }
+
+  if (expr.type === "binary") {
+    const op = String(expr.op).toUpperCase();
+
+    if (op === "AND") {
+      const left = checkTenantExpr(expr.left, tenantCols, expectedTenantId);
+      const right = checkTenantExpr(expr.right, tenantCols, expectedTenantId);
+      return {
+        hasValidTenantFilter:
+          (left.hasValidTenantFilter || right.hasValidTenantFilter) &&
+          !left.spoofed &&
+          !right.spoofed,
+        spoofed: left.spoofed || right.spoofed,
+      };
+    }
+
+    // In an OR branch, BOTH sides must be tenant-scoped to prevent `(tenant_id = 'a' OR 1=1)`
+    if (op === "OR") {
+      const left = checkTenantExpr(expr.left, tenantCols, expectedTenantId);
+      const right = checkTenantExpr(expr.right, tenantCols, expectedTenantId);
+      return {
+        hasValidTenantFilter: left.hasValidTenantFilter && right.hasValidTenantFilter,
+        spoofed: left.spoofed || right.spoofed,
+      };
+    }
+
+    if (op === "=") {
+      const colName = extractColumnName(expr.left);
+      const literalVal = extractScalarValue(expr.right);
+
+      if (colName && tenantCols.has(colName) && isSafeScalarOrParam(expr.right)) {
+        if (
+          expectedTenantId !== undefined &&
+          literalVal !== null &&
+          String(literalVal) !== String(expectedTenantId)
+        ) {
+          return { hasValidTenantFilter: false, spoofed: true };
+        }
+        return { hasValidTenantFilter: true, spoofed: false };
+      }
+    }
+  }
+
+  return { hasValidTenantFilter: false, spoofed: false };
+}
+
+function isBoundedWhere(expr: any): boolean {
+  if (!expr || typeof expr !== "object") return false;
+
+  if (expr.type === "binary") {
+    const op = String(expr.op).toUpperCase();
+
+    if (op === "AND") {
+      // If either side has a tautology, reject; otherwise require at least one bounded key
+      if (isTautologyOrSweep(expr.left) || isTautologyOrSweep(expr.right)) {
+        return false;
+      }
+      return isBoundedWhere(expr.left) || isBoundedWhere(expr.right);
+    }
+
+    if (op === "OR") {
+      // Every branch of an OR must independently be safely bounded
+      return isBoundedWhere(expr.left) && isBoundedWhere(expr.right);
+    }
+
+    if (op === "=") {
+      const leftCol = extractColumnName(expr.left);
+      const rightCol = extractColumnName(expr.right);
+
+      // Block column self-comparison (e.g. WHERE id = id)
+      if (leftCol && rightCol) return false;
+
+      if (leftCol && BOUNDED_KEY_COLUMNS.has(leftCol)) {
+        return isSafeScalarOrParam(expr.right);
+      }
+      return false;
+    }
+
+    if (op === "IN") {
+      const leftCol = extractColumnName(expr.left);
+      if (!leftCol || !BOUNDED_KEY_COLUMNS.has(leftCol)) return false;
+
+      if (expr.right && expr.right.type === "list" && Array.isArray(expr.right.expressions)) {
         return (
-          rightNode.expressions.length > 0 &&
-          rightNode.expressions.length <= 100 &&
-          rightNode.expressions.every((item: any) =>
-            SAFE_CONST_TYPES.has(unwrapOperand(item)?.type)
-          )
+          expr.right.expressions.length > 0 &&
+          expr.right.expressions.length <= 100 &&
+          expr.right.expressions.every((item: any) => isSafeScalarOrParam(item))
         );
       }
       return false;
     }
   }
+
   return false;
 }
 
-export function evaluateSql(
-  sql: string,
-  config?: FirewallConfig
-): PolicyVerdict {
-  const start = performance.now();
-  const violations: PolicyViolation[] = [];
-  const uniqueKeys = config?.uniqueKeys ?? DEFAULT_UNIQUE_KEYS;
-  const safeFunctions = config?.safeFunctions ?? DEFAULT_SAFE_SQL_FUNCTIONS;
+function isTautologyOrSweep(expr: any): boolean {
+  if (!expr || typeof expr !== "object") return true;
 
-  if (!sql || sql.length > 16384) {
-    return {
-      decision: "block",
-      violations: [
-        {
-          rule: "PAYLOAD_LIMIT",
-          detail: "SQL query empty or exceeds 16KB AST limit",
-        },
-      ],
-      evaluatedAt: Date.now(),
-      latencyMs: performance.now() - start,
-    };
-  }
-
-  let statements: any[];
-  try {
-    statements = parse(sql);
-  } catch (err) {
-    return {
-      decision: "block",
-      violations: [
-        {
-          rule: "PARSE_FAILURE",
-          detail: `SQL failed to parse: ${(err as Error).message}`,
-        },
-      ],
-      evaluatedAt: Date.now(),
-      latencyMs: performance.now() - start,
-    };
-  }
-
-  if (statements.length === 0) {
-    return {
-      decision: "block",
-      violations: [
-        { rule: "EMPTY_STATEMENT", detail: "No valid SQL statement found" },
-      ],
-      evaluatedAt: Date.now(),
-      latencyMs: performance.now() - start,
-    };
-  }
-
-  if (statements.length > 1) {
-    violations.push({
-      rule: "MULTI_STATEMENT",
-      detail: `${statements.length} statements in one payload`,
-    });
-  }
-
-  for (const stmt of statements) {
-    const topType = String(stmt?.type || "").toLowerCase();
-    if (!ALLOWED_TOP_LEVEL_STMTS.has(topType)) {
-      violations.push({
-        rule: "DISALLOWED_STATEMENT_TYPE",
-        detail: `Top-level statement type "${topType}" is not allowlisted`,
-      });
+  if (expr.type === "binary") {
+    const op = String(expr.op).toUpperCase();
+    if (op === "OR") {
+      return isTautologyOrSweep(expr.left) || isTautologyOrSweep(expr.right);
+    }
+    if (op === "AND") {
+      return isTautologyOrSweep(expr.left) || isTautologyOrSweep(expr.right);
+    }
+    if (op === "=") {
+      const leftCol = extractColumnName(expr.left);
+      const rightCol = extractColumnName(expr.right);
+      if (leftCol && rightCol && leftCol === rightCol) return true;
+      if (!leftCol && !rightCol) return true; // Constant comparison like 1 = 1
+      return false;
+    }
+    if (["!=", "<>", ">", "<", ">=", "<=", "LIKE", "ILIKE"].includes(op)) {
+      return true;
     }
   }
 
-  try {
-    walk(statements, (node) => {
-      const nodeType = String(node.type || "").toLowerCase();
-
-      if (DESTRUCTIVE_DDL.has(nodeType)) {
-        violations.push({
-          rule: "DESTRUCTIVE_DDL",
-          detail: `Blocked statement type "${nodeType}"`,
-        });
-      }
-
-      // Check EVERY function call node across the entire AST (with or without FROM)
-      if (nodeType === "call") {
-        const fnName = String((node.function as any)?.name || "").toLowerCase();
-        if (DANGEROUS_PG_FUNCTIONS.has(fnName)) {
-          violations.push({
-            rule: "DANGEROUS_FUNCTION_CALL",
-            detail: `Blocked dangerous Postgres function "${fnName}()"`,
-          });
-        } else if (fnName && !safeFunctions.has(fnName)) {
-          violations.push({
-            rule: "UNTRUSTED_FUNCTION_CALL",
-            detail: `Non-allowlisted function "${fnName}()" is blocked`,
-          });
-        }
-      }
-
-      if (nodeType === "insert" && node.onConflict) {
-        const onConflict = node.onConflict as any;
-        if (
-          onConflict.do &&
-          typeof onConflict.do === "object" &&
-          Array.isArray(onConflict.do.sets)
-        ) {
-          const targetTable = String((node.into as any)?.name || "");
-          if (
-            !onConflict.do.where ||
-            !isBounded(onConflict.do.where as Expr, targetTable, uniqueKeys)
-          ) {
-            violations.push({
-              rule: "UNBOUNDED_UPSERT",
-              detail:
-                "ON CONFLICT DO UPDATE requires a bounded WHERE clause on the conflict update",
-            });
-          }
-        }
-      }
-
-      if (BOUNDED_MUTATION.has(nodeType)) {
-        const isJoinedUpdate = nodeType === "update" && Boolean(node.from);
-        const isJoinedDelete =
-          nodeType === "delete" && Boolean((node as any).using);
-        if (isJoinedUpdate || isJoinedDelete) {
-          violations.push({
-            rule: "JOINED_MUTATION_BLOCKED",
-            detail: `"${nodeType}" with FROM/USING join is disallowed`,
-          });
-        }
-
-        const targetTable = String(
-          nodeType === "update"
-            ? (node.table as any)?.name || ""
-            : (node.from as any)?.name || ""
-        );
-        const where = node.where as Expr | undefined;
-        if (!where) {
-          violations.push({
-            rule: "UNBOUNDED_MUTATION",
-            detail: `"${nodeType}" has no WHERE clause`,
-          });
-        } else if (!isBounded(where, targetTable, uniqueKeys)) {
-          violations.push({
-            rule: "UNSAFE_WHERE_BOUNDARY",
-            detail: `"${nodeType}" WHERE clause is not syntactically bounded to a unique identifier`,
-          });
-        }
-      }
-    });
-  } catch (walkErr: any) {
-    violations.push({
-      rule: "AST_WALK_LIMIT",
-      detail: walkErr.message || "AST traversal limit exceeded",
-    });
+  if (expr.type === "unary") {
+    const op = String(expr.op).toUpperCase();
+    if (op.includes("NULL") || op === "NOT") return true;
   }
 
-  return {
-    decision: violations.length === 0 ? "allow" : "block",
-    violations,
-    evaluatedAt: Date.now(),
-    latencyMs: performance.now() - start,
-  };
+  return false;
+}
+
+function extractColumnName(node: any): string | null {
+  if (!node || typeof node !== "object") return null;
+  if (node.type === "ref" && typeof node.name === "string") {
+    return node.name.toLowerCase();
+  }
+  return null;
+}
+
+function extractScalarValue(node: any): string | number | boolean | null {
+  if (!node || typeof node !== "object") return null;
+  if (
+    node.type === "string" ||
+    node.type === "integer" ||
+    node.type === "numeric" ||
+    node.type === "boolean"
+  ) {
+    return node.value;
+  }
+  return null;
+}
+
+function isSafeScalarOrParam(node: any): boolean {
+  if (!node || typeof node !== "object") return false;
+
+  if (node.type === "string") {
+    const val = String(node.value).trim().toLowerCase();
+    if (val === "true" || val === "false" || val === "%" || val === "") {
+      return false;
+    }
+    return true;
+  }
+
+  if (node.type === "integer" || node.type === "numeric") {
+    return true;
+  }
+
+  if (node.type === "parameter") {
+    return true;
+  }
+
+  // Support typed parameters like $1::uuid
+  if (node.type === "cast") {
+    return isSafeScalarOrParam(node.operand);
+  }
+
+  // Support negative numbers like -5
+  if (node.type === "unary" && (node.op === "-" || node.op === "+")) {
+    return (
+      node.operand &&
+      (node.operand.type === "integer" || node.operand.type === "numeric")
+    );
+  }
+
+  // Support ANY($1) array parameter binding
+  if (
+    node.type === "call" &&
+    node.function &&
+    String(node.function.name).toLowerCase() === "any" &&
+    Array.isArray(node.args) &&
+    node.args.length === 1
+  ) {
+    return isSafeScalarOrParam(node.args[0]);
+  }
+
+  if (node.type === "array select" && node.expr) {
+    return isSafeScalarOrParam(node.expr);
+  }
+
+  return false;
+}
+
+function scanForBlockedFunctions(
+  node: any,
+  addViolation: (rule: RuleViolationCode, detail: string) => void
+): void {
+  if (!node || typeof node !== "object") return;
+
+  if (node.type === "call" && node.function && typeof node.function.name === "string") {
+    const fnName = node.function.name.toLowerCase();
+    if (BLOCKED_FUNCTIONS.has(fnName)) {
+      addViolation(
+        "SIDE_EFFECT_FUNCTION",
+        `Execution of administrative/side-effect function '${fnName}()' is blocked.`
+      );
+    }
+  }
+
+  for (const key of Object.keys(node)) {
+    const child = node[key];
+    if (Array.isArray(child)) {
+      for (const item of child) {
+        scanForBlockedFunctions(item, addViolation);
+      }
+    } else if (child && typeof child === "object") {
+      scanForBlockedFunctions(child, addViolation);
+    }
+  }
 }
