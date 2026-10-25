@@ -51,7 +51,7 @@ await pool.query(llmGeneratedSql);
 | Negative id (-5) | `DELETE FROM t WHERE id = -5;` | **ALLOW** | PASS (ALLOW) | `NONE` | 0.857ms |
 
 **Summary:** 28/28 passed (21/21 red-team vectors blocked, 7/7 legitimate parameterized/bounded queries allowed)  
-**Warm Latency Benchmark (1,000 AST Evaluations):** `p50 = 0.346ms` | `p95 = 1.007ms` | `p99 = 1.575ms`
+**Warm Latency Benchmark (1,000 AST Evaluations):** `p50 = 0.339ms` | `p95 = 1.007ms` | `p99 = 1.575ms`
 
 ## Architectural Scope & Known Limits (v0.1 -> v0.2 Roadmap)
 
